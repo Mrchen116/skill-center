@@ -21,6 +21,31 @@ def _now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def _default_dev_tasks_payload() -> dict[str, Any]:
+    script_path = str(Path(__file__).resolve())
+    return {
+        "_note": f"Runtime file (gitignored). Update via: python3 {script_path} ...",
+        "version": 1,
+        "milestones": [],
+    }
+
+
+def _ensure_dev_tasks_file(path: Path) -> None:
+    """
+    Ensure the dev-tasks.json file exists on disk.
+
+    Reason: control tower may call `get` on a fresh repo/worktree; we want `get`/`update` to auto-init.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # Exclusive create: if another process already created it, do nothing.
+        with path.open("x", encoding="utf-8") as f:
+            json.dump(_default_dev_tasks_payload(), f, ensure_ascii=False, indent=2)
+            f.write("\n")
+    except FileExistsError:
+        return
+
+
 def _eprint(*args: object) -> None:
     print(*args, file=sys.stderr)
 
@@ -88,11 +113,11 @@ def _release_lock(lock: Lock) -> None:
 
 def _load_json(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return {"version": 1, "milestones": []}
+        return _default_dev_tasks_payload()
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return {"version": 1, "milestones": []}
+        return _default_dev_tasks_payload()
     raw = raw.strip()
     if raw == "":
         raise DevTasksError(f"Empty JSON file: {path}")
@@ -201,8 +226,7 @@ def _reconcile(data: dict[str, Any]) -> int:
 
 def cmd_get(args: argparse.Namespace) -> int:
     path = _resolve_real_path(Path(args.path))
-    if not path.exists():
-        raise DevTasksError(f"Not found: {path}")
+    _ensure_dev_tasks_file(path)
     data = _load_json(path)
     if args.milestone_id:
         found = _find_milestone(data["milestones"], args.milestone_id)
@@ -220,6 +244,7 @@ def cmd_update(args: argparse.Namespace) -> int:
     lock_dir = Path(args.lock_dir) if args.lock_dir else (real_path.parent / "locks" / "dev-tasks.lock")
     lock = _acquire_lock(lock_dir, timeout_s=args.lock_timeout_s)
     try:
+        _ensure_dev_tasks_file(real_path)
         data = _load_json(real_path)
         milestones: list[dict[str, Any]] = data["milestones"]
 
