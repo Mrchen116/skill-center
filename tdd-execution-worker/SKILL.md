@@ -149,7 +149,8 @@ description: 子 agent 执行面技能。接收主 agent 派发的一个 Milesto
 2. `git rebase origin/main`（冲突按第 5 节处理）
 3. 运行 `test_command`（必须全绿）
 4. 获取合并锁（`data/locks/merge.lock`，目录锁即可），确保同一时刻只合并一个 Milestone  
-5. 合并并 push：
+5. 合并并 push（worktree 内无法 checkout main，必须先回主仓）：
+   - `cd <主仓根目录>`
    - `git checkout main && git pull --rebase origin main`
    - `git merge --no-ff <branch>`
    - `git push origin main`
