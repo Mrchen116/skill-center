@@ -79,6 +79,25 @@ class Lock:
     owner_file: Path
 
 
+_VALID_STATUSES = {"READY", "RUNNING", "DONE", "BLOCKED", "FAILED"}
+
+
+def _normalize_status(value: str) -> str:
+    v = value.strip().upper()
+    if v not in _VALID_STATUSES:
+        raise DevTasksError(f"Invalid status: {value} (expected one of: {', '.join(sorted(_VALID_STATUSES))})")
+    return v
+
+
+def _normalize_status_list(values: list[str] | None) -> set[str] | None:
+    if values is None:
+        return None
+    out: list[str] = []
+    for v in values:
+        out.append(_normalize_status(v))
+    return set(_unique(out))
+
+
 def _acquire_lock(lock_dir: Path, timeout_s: float) -> Lock:
     lock_dir = lock_dir
     lock_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -228,6 +247,8 @@ def cmd_get(args: argparse.Namespace) -> int:
     path = _resolve_real_path(Path(args.path))
     _ensure_dev_tasks_file(path)
     data = _load_json(path)
+    if args.milestone_id and args.status:
+        raise DevTasksError("get: --milestone-id and --status are mutually exclusive")
     if args.milestone_id:
         found = _find_milestone(data["milestones"], args.milestone_id)
         if not found:
@@ -235,7 +256,45 @@ def cmd_get(args: argparse.Namespace) -> int:
         _, milestone = found
         print(json.dumps(milestone, ensure_ascii=False, indent=2) + "\n")
         return 0
-    print(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    status_set = _normalize_status_list(args.status)
+    milestones: list[dict[str, Any]] = data.get("milestones", [])
+    if status_set is not None:
+        filtered: list[dict[str, Any]] = []
+        for m in milestones:
+            s = m.get("status")
+            if not isinstance(s, str):
+                continue
+            if s.strip().upper() in status_set:
+                filtered.append(m)
+        milestones = filtered
+
+    # For large result sets, only print a compact summary to reduce noise and context.
+    # Users can request details per milestone via `--milestone-id`.
+    if (args.status is not None or status_set is None) and len(milestones) > 10:
+        summary = []
+        for m in milestones:
+            summary.append(
+                {
+                    "milestone_id": m.get("milestone_id"),
+                    "title": m.get("title"),
+                    "blocked_by": m.get("blocked_by"),
+                    "status": m.get("status"),
+                }
+            )
+        _eprint(
+            f"info: {len(milestones)} milestones matched; showing only milestone_id/title/blocked_by/status. "
+            "Use: dev_tasks.py get --milestone-id <id> for full details."
+        )
+        out = {
+            "version": data.get("version", 1),
+            "milestones": summary,
+        }
+        print(json.dumps(out, ensure_ascii=False, indent=2) + "\n")
+        return 0
+
+    out = dict(data)
+    out["milestones"] = milestones
+    print(json.dumps(out, ensure_ascii=False, indent=2) + "\n")
     return 0
 
 
@@ -387,6 +446,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_get = sub.add_parser("get", help="Print all milestones or one milestone")
     p_get.add_argument("--path", default="data/dev-tasks.json", help="Path to dev-tasks.json (may be a symlink)")
     p_get.add_argument("--milestone-id", help="If set, print only this milestone")
+    p_get.add_argument(
+        "--status",
+        type=_parse_csv,
+        help="Comma-separated statuses to filter by (READY|RUNNING|DONE|BLOCKED|FAILED). Mutually exclusive with --milestone-id.",
+    )
     p_get.set_defaults(func=cmd_get)
 
     p_update = sub.add_parser("update", help="Update a milestone (status/fields) and auto-reconcile")
