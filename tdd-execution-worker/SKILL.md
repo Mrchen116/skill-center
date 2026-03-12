@@ -70,9 +70,14 @@ description: 子 agent 执行面技能。接收主 agent 派发的一个 Milesto
 - 在当前仓库新建并切到分支：`<branch>`
 
 #### use_worktree=true（并行/隔离）
+0. 先解析主仓根目录：`repo_root=$(git rev-parse --show-toplevel)`
+   - 即使当前 shell 已经身处某个 worktree，也必须以 `repo_root` 为锚点；禁止用 `pwd`、相对路径或“当前目录”推导新的 `worktree_dir`
+   - 默认约定：`worktree_dir="$repo_root/.worktrees/<milestone_id>"`
+   - 禁止在已有 `.claude/worktrees/...`、`.worktrees/...` 或任何其他 worktree 目录内部，再创建新的 agent worktree / milestone worktree
 1. 如果 `worktree_dir` 已存在：直接进入复用（用于换人/续跑）  
 2. 否则创建 worktree：
-   - `git worktree add -b <branch> <worktree_dir>`
+   - 先确认 `worktree_dir` 是位于 `repo_root/.worktrees/` 下的绝对路径
+   - 再执行 `git -C "$repo_root" worktree add -b <branch> <worktree_dir>`
 3. 在 worktree 中确保共享派工板：
    - `data/dev-tasks.json` 必须 symlink 到主仓同一份（避免状态分叉）
    - 锁目录（如 `data/locks/`）也必须共享（symlink 或使用主仓绝对路径）
@@ -150,7 +155,8 @@ description: 子 agent 执行面技能。接收主 agent 派发的一个 Milesto
 3. 运行 `test_command`（必须全绿）
 4. 获取合并锁（`data/locks/merge.lock`，目录锁即可），确保同一时刻只合并一个 Milestone  
 5. 合并并 push（worktree 内无法 checkout main，必须先回主仓）：
-   - `cd <主仓根目录>`
+   - `repo_root=$(git rev-parse --show-toplevel)`
+   - `cd "$repo_root"`
    - `git checkout main && git pull --rebase origin main`
    - `git merge --no-ff <branch>`
    - `git push origin main`
