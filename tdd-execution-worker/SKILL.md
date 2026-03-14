@@ -164,7 +164,7 @@ description: 子 agent 执行面技能。接收主 agent 派发的一个 Milesto
 7. 用脚本更新 `data/dev-tasks.json`（不要手改），将该 Milestone 更新为 `DONE` 并写入 `result`：
 
 ```bash
-python3 /Users/czj/.codex/skills/tdd-control-tower/scripts/dev_tasks.py update --path data/dev-tasks.json --milestone-id "<milestone_id>" --status DONE --result-json '{"solution_summary":"...","tests":"...","commits":{"C1":"...","C2":"...","C3":"..."}}'
+python3 /Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py update --path data/dev-tasks.json --milestone-id "<milestone_id>" --status DONE --result-json '{"solution_summary":"...","tests":"...","commits":{"C1":"...","C2":"...","C3":"..."}}'
 ```
 
 8. 清理（仅当 `use_worktree=true` 且 Milestone 已 `DONE`）：
@@ -234,4 +234,4 @@ python3 /Users/czj/.codex/skills/tdd-control-tower/scripts/dev_tasks.py update -
 3. 通过工具/脚本将 `data/dev-tasks.json` 中该 Milestone 释放（回到 READY）或标记 BLOCKED（写明原因），并保留 `worktree_dir/branch` 以便新 sub agent 复用
 
 脚本路径：
-- `/Users/czj/.codex/skills/tdd-control-tower/scripts/dev_tasks.py`
+- `/Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py`

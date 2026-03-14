@@ -46,6 +46,16 @@ description: 主 agent 项目负责人/调度技能。以 Milestone 为单位安
 - `LOGBOOK.md`、`ROADMAP.md`：不存在就 `touch` 创建空文件。
 - `data/dev-tasks.json`：不需要在这里手写内容；直接运行本技能脚本的 `get`/`update`，若文件不存在脚本会自动初始化。
 
+### 2.5 worktree 定位规则（硬规则）
+
+所有 worktree 都必须锚定在主仓根目录，而不是当前 shell 所在目录：
+- 先解析主仓根目录：`git rev-parse --show-toplevel`
+- 若当前就在某个 worktree 中：仍以上述命令返回的主仓根目录为准，不得用 `pwd`、相对路径或“当前目录”推导新的 `worktree_dir`
+- milestone worktree 统一放在 `主仓根目录/.worktrees/<milestone_id>`
+- 禁止在已有 `.claude/worktrees/...`、`.worktrees/...` 或任何其他 worktree 目录内部，再派生新的 agent worktree / milestone worktree
+- `worktree_dir` 必须写绝对路径，写入前先做一次规范化（例如 `$(git rev-parse --show-toplevel)/.worktrees/M123`）
+- 若使用 Claude Code 的 Agent 工具派发 sub agent：禁止设置 `isolation=worktree`；主 agent 只分配 `worktree_dir/branch`，由 sub agent 按本技能复用或创建 milestone worktree
+
 ---
 
 ## 3) dev-tasks.json 最小字段（Milestone 级）
@@ -75,19 +85,19 @@ description: 主 agent 项目负责人/调度技能。以 Milestone 为单位安
 
 本技能已内置脚本（带锁、原子写、校验迁移、自动 reconcile）。不要手改 `data/dev-tasks.json`、不要另写脚本，直接调用它：
 
-- Script: `/Users/czj/.codex/skills/tdd-control-tower/scripts/dev_tasks.py`
+- Script: `/Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py`
 - `get`：读取全部/单个 Milestone
 - `update`：更新单个 Milestone 并自动 reconcile
 
 示例：
 
 ```bash
-python3 /Users/czj/.codex/skills/tdd-control-tower/scripts/dev_tasks.py get --path data/dev-tasks.json
-python3 /Users/czj/.codex/skills/tdd-control-tower/scripts/dev_tasks.py get --path data/dev-tasks.json --milestone-id M12
-python3 /Users/czj/.codex/skills/tdd-control-tower/scripts/dev_tasks.py get --path data/dev-tasks.json --status READY
-python3 /Users/czj/.codex/skills/tdd-control-tower/scripts/dev_tasks.py get --path data/dev-tasks.json --status RUNNING,BLOCKED
-python3 /Users/czj/.codex/skills/tdd-control-tower/scripts/dev_tasks.py update --path data/dev-tasks.json --milestone-id M12 --status RUNNING --claimed-by "agent-1"
-python3 /Users/czj/.codex/skills/tdd-control-tower/scripts/dev_tasks.py update --path data/dev-tasks.json --milestone-id M12 --status DONE --result-json '{"solution_summary":"...","tests":"pytest -q"}'
+python3 /Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py get --path data/dev-tasks.json
+python3 /Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py get --path data/dev-tasks.json --milestone-id M12
+python3 /Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py get --path data/dev-tasks.json --status READY
+python3 /Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py get --path data/dev-tasks.json --status RUNNING,BLOCKED
+python3 /Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py update --path data/dev-tasks.json --milestone-id M12 --status RUNNING --claimed-by "agent-1"
+python3 /Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py update --path data/dev-tasks.json --milestone-id M12 --status DONE --result-json '{"solution_summary":"...","tests":"pytest -q"}'
 ```
 
 `update` 语义（脚本已实现）：
@@ -121,13 +131,13 @@ python3 /Users/czj/.codex/skills/tdd-control-tower/scripts/dev_tasks.py update -
 
 ```bash
 # 新需求=可立即并行：READY
-python3 /Users/czj/.codex/skills/tdd-control-tower/scripts/dev_tasks.py update --path data/dev-tasks.json --milestone-id M13 --create --title "..." --goal "..." --exit-criteria "..." --status READY
+python3 /Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py update --path data/dev-tasks.json --milestone-id M13 --create --title "..." --goal "..." --exit-criteria "..." --status READY
 
 # 新需求=依赖/需串行：BLOCKED + blocked_by
-python3 /Users/czj/.codex/skills/tdd-control-tower/scripts/dev_tasks.py update --path data/dev-tasks.json --milestone-id M14 --create --title "..." --goal "..." --exit-criteria "..." --status BLOCKED --blocked-by "M12,M10"
+python3 /Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py update --path data/dev-tasks.json --milestone-id M14 --create --title "..." --goal "..." --exit-criteria "..." --status BLOCKED --blocked-by "M12,M10"
 
 # 新需求=依赖待定：BLOCKED + blocked_by=null(pending)
-python3 /Users/czj/.codex/skills/tdd-control-tower/scripts/dev_tasks.py update --path data/dev-tasks.json --milestone-id M15 --create --title "..." --goal "..." --exit-criteria "..." --status BLOCKED --blocked-by-pending
+python3 /Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py update --path data/dev-tasks.json --milestone-id M15 --create --title "..." --goal "..." --exit-criteria "..." --status BLOCKED --blocked-by-pending
 ```
 
 写入后立刻回到主循环，不要因为新增任务而中断既有派发与监控。
@@ -137,7 +147,7 @@ python3 /Users/czj/.codex/skills/tdd-control-tower/scripts/dev_tasks.py update -
 产品级验收要形成闭环：
 - 验收发现问题时，把问题转成新的 Milestone，写回 `data/dev-tasks.json`。
 - 产品级验收 sub agent 只返回问题清单与验收报告；由你负责判断如何拆成后续 Milestone 并写回 `data/dev-tasks.json`。
-- 原验收 Milestone 先不要标记 `DONE`；等这些新 Milestone 完成后，再回来续跑或重跑验收。
+- 原验收 Milestone 先不要标记 `DONE`；等这些新 Milestone 完成后，再回来用最新代码仓续跑agent或重跑agent验收。
 - 验收结果至少要写清：通过项、问题清单、需要你进一步规划的后续工作。
 - 只有复验后没有新问题，验收 Milestone 才能 `DONE`。
 
@@ -157,6 +167,7 @@ python3 /Users/czj/.codex/skills/tdd-control-tower/scripts/dev_tasks.py update -
    - 实现型 Milestone：派发 `/Users/czj/.codex/skills/tdd-execution-worker/SKILL.md`
    - 产品级验收 Milestone：派发 `/Users/czj/.codex/skills/product-acceptance-reviewer/SKILL.md`
    - 任务单位：整个 Milestone（同一 sub agent 在同一 worktree 内完成该 Milestone 的工作）
+   - 若使用 Claude Code 的 Agent 工具：`isolation` 保持默认，严禁设置成 `worktree`！严禁设置成 `worktree`。它的worktree逻辑和本skill冲突！
    - 若是实现型 Milestone：派发包必须包含 execution worker 的输入契约字段（尤其 `test_command`）
    - 若是产品级验收 Milestone：派发包必须包含本次要体验的功能范围、相关需求/SPEC/README/运行说明、建议入口、明确 out-of-scope；并强调该 sub agent 只做产品 judgment / 真实体验 / 验收报告，不修代码、不读大段实现、不改 `dev-tasks.json`
    - 默认“一个 Milestone 一个 sub agent”，不要让同一个 sub agent 接连跑多个 Milestone
