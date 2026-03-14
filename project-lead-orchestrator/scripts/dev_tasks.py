@@ -303,6 +303,7 @@ def cmd_update(args: argparse.Namespace) -> int:
 
         found = _find_milestone(milestones, args.milestone_id)
         now = _now_iso()
+        action = "更新"
 
         if not found:
             if not args.create:
@@ -324,6 +325,7 @@ def cmd_update(args: argparse.Namespace) -> int:
                 "updated_at": now,
             }
             milestones.append(milestone)
+            action = "创建并更新"
         else:
             _, milestone = found
 
@@ -425,6 +427,7 @@ def cmd_update(args: argparse.Namespace) -> int:
             _reconcile(data)
 
         _write_json_atomic(real_path, data)
+        print(f"{action}成功: {args.milestone_id}")
         return 0
     finally:
         _release_lock(lock)
