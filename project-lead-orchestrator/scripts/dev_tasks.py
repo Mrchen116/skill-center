@@ -268,28 +268,22 @@ def cmd_get(args: argparse.Namespace) -> int:
                 filtered.append(m)
         milestones = filtered
 
-    # For large result sets, only print a compact summary to reduce noise and context.
-    # Users can request details per milestone via `--milestone-id`.
+    # 结果过多时改为紧凑文本列表，避免 JSON 占用过多上下文。
     if (args.status is not None or status_set is None) and len(milestones) > 10:
-        summary = []
-        for m in milestones:
-            summary.append(
-                {
-                    "milestone_id": m.get("milestone_id"),
-                    "title": m.get("title"),
-                    "blocked_by": m.get("blocked_by"),
-                    "status": m.get("status"),
-                }
-            )
         _eprint(
-            f"info: {len(milestones)} milestones matched; showing only milestone_id/title/blocked_by/status. "
+            f"info: {len(milestones)} milestones matched; showing compact list. "
             "Use: dev_tasks.py get --milestone-id <id> for full details."
         )
-        out = {
-            "version": data.get("version", 1),
-            "milestones": summary,
-        }
-        print(json.dumps(out, ensure_ascii=False, indent=2) + "\n")
+        id_width = max(len(str(m.get("milestone_id") or "")) for m in milestones)
+        status_width = max(len(str(m.get("status") or "")) for m in milestones)
+        print("[id] [status] title")
+        print()
+        for m in milestones:
+            milestone_id = str(m.get("milestone_id") or "-")
+            status = str(m.get("status") or "-")
+            title = str(m.get("title") or "")
+            print(f"{milestone_id:<{id_width}} {status:<{status_width}} {title}")
+        print()
         return 0
 
     out = dict(data)
