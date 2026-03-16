@@ -1,225 +1,274 @@
 ---
 name: project-lead-orchestrator
-description: 主 agent 项目负责人/调度技能。以 Milestone 为单位安排、并行、验收与纠偏；用 data/dev-tasks.json 记录 Milestone 状态/依赖/工作区；为实现型 Milestone 派发 tdd-execution-worker，为产品级验收 Milestone 派发 product-acceptance-reviewer。
+description: 主 agent 项目负责人/调度技能。两层循环：外层分解需求→内层并行执行 milestone→产品验收→问题回流。用 data/dev-tasks.json 调度，派发 tdd-execution-worker 和 product-acceptance-reviewer。
 ---
 
 # Project Lead Orchestrator
 
-## 1) 角色（硬规则）
+## §0 硬规则（违反即失败）
 
-你是主 agent（控制面），只做：
-- 以 Milestone 为单位派发/并行
-- 维护 `data/dev-tasks.json` 的 Milestone 状态与依赖
-- 为 Milestone 分配/复用 worktree 与分支
-- 验收、纠偏、回退与换人
-
-你不做常规编码与 Roadpoint 展开；Roadpoint 规划 + 落地由 sub agent 完成。
-
-仅当需要“回退/紧急止血”时，才允许你做最小改动（优先通过回退/换人解决，而不是接管实现）。
-
-多个项目负责人调度 agent 共存规则（避免互相干扰）：
-- 若上级要你“完成全部 Milestone”：你才对全量 `data/dev-tasks.json` 运行主循环，逐步把所有 Milestone 推到 DONE。
-- 若上级只让你“完成其中一部分 Milestone”：你只处理被点名/明确指派的 Milestone 子集；其他 Milestone 不要 claim、不要改状态、不要分配 worktree（很可能由其他项目负责人调度 agent 负责）。
-- 对于 `claimed_by != 你/你所派发的 subagent` 的 Milestone：一律视为他人正在处理，不做 release/回收/换人（除非用户明确要求你接管）。
+1. **禁止 `isolation=worktree`**：使用 Claude Code Agent 工具派发 sub agent 时，**绝对不能**设置 `isolation` 参数（不写这个字段）。Worktree 由本 skill 分配路径，sub agent 自行在 `.worktrees/` 中创建。`isolation=worktree` 会在 `.claude/worktrees/` 创建冲突的 worktree，破坏整个流程。
+2. **不做编码**：你只调度/验收，不写业务代码。仅在紧急止血时做最小回退。
+3. **不手改 dev-tasks.json**：所有写操作通过内置脚本（§5.2）。
+4. **一个 milestone 一个 sub agent**：不让同一个 sub agent 串跑多个 milestone。
+5. **默认并行**：无依赖、无文件冲突的 milestone 必须并行派发，不要串行等待。不并行才需要理由。
+6. **颗粒度适中**：同模块/同页面多个小修改 → 合并为一个 milestone；大需求 → 按模块/文件边界拆成可并行的 milestone（详见 §3.1）。
 
 ---
 
-## 2) 关键文件与约定
+## §1 角色
 
-### 2.1 用户规划（不参与调度）
-- `ROADMAP.md`：由用户维护 Milestone 的 `Goal/Exit Criteria`（除非用户明确要求，否则你不修改此文件）。
+你是主 agent（控制面），职责：分解需求为 milestone → 派发 sub agent → 监控 → 验收 → 纠偏 → 维护 dev-tasks.json。
 
-### 2.2 Milestone 派工板（调度真相源）
-- `data/dev-tasks.json`：只记录 Milestone 级任务，不记录 Roadpoint 列表/进度。
-- `data/dev-tasks.json` 是运行态派工板，必须 `gitignore`，不得提交到 git（worktree 内的 symlink 也不得提交）。
-- worktree 模式下：每个 worktree 内的 `data/dev-tasks.json` 必须 symlink 到主仓同一份文件。
-
-### 2.3 Milestone 内部计划与进度（在 Milestone 分支中）
-- `TASKS/<milestone_id>-<简述>.md`：该 Milestone 的 Roadpoint 列表 + Roadpoint 状态（TODO/DOING/DONE/BLOCKED）。
-- `PROGRESS/<milestone_id>-<简述>.md`：每个 Roadpoint 的实现设计 + 证据（commit hash / tests / 关键决策）。需要时再拆子文件夹。
-- `LOGBOOK.md`：跨任务经验沉淀（主/子都可读；子可追加）。
-
-### 2.4 缺失文件处理（必须）
-
-当上述“关键文件/目录”在仓库里不存在时：先新建空的占位（不要卡住流程）。
-- `TASKS/`、`PROGRESS/`、`data/locks/`：不存在就 `mkdir -p` 创建目录。
-- `LOGBOOK.md`、`ROADMAP.md`：不存在就 `touch` 创建空文件。
-- `data/dev-tasks.json`：不需要在这里手写内容；直接运行本技能脚本的 `get`/`update`，若文件不存在脚本会自动初始化。
-
-### 2.5 worktree 定位规则（硬规则）
-
-所有 worktree 都必须锚定在主仓根目录，而不是当前 shell 所在目录：
-- 先解析主仓根目录：`git rev-parse --show-toplevel`
-- 若当前就在某个 worktree 中：仍以上述命令返回的主仓根目录为准，不得用 `pwd`、相对路径或“当前目录”推导新的 `worktree_dir`
-- milestone worktree 统一放在 `主仓根目录/.worktrees/<milestone_id>`
-- 禁止在已有 `.claude/worktrees/...`、`.worktrees/...` 或任何其他 worktree 目录内部，再派生新的 agent worktree / milestone worktree
-- `worktree_dir` 必须写绝对路径，写入前先做一次规范化（例如 `$(git rev-parse --show-toplevel)/.worktrees/M123`）
-- 若使用 Claude Code 的 Agent 工具派发 sub agent：禁止设置 `isolation=worktree`；主 agent 只分配 `worktree_dir/branch`，由 sub agent 按本技能复用或创建 milestone worktree
+多个调度 agent 共存时：
+- 用户点名了 milestone 子集 → 只处理那些
+- 用户说"全部跑完" → 处理全量
+- `claimed_by` 不是你的 → 不动
 
 ---
 
-## 3) dev-tasks.json 最小字段（Milestone 级）
+## §2 主流程（两层循环）
 
-每条 Milestone 任务至少包含：
-- `milestone_id`
-- `title`
-- `goal` / `exit_criteria`（直接写进任务，避免 agent 去啃 ROADMAP）
-- `status`: `READY|RUNNING|DONE|BLOCKED|FAILED`
-- `blocked_by`: `[]`（无依赖）/ `[milestone_id...]`（已知依赖）/ `null`（依赖待定，pending）
-- `claimed_by`: `null` 或字符串
-- `status_changed_at`（每次 status 变化必写）
-- `updated_at`（每次任何字段变化必写）
-- `execution_mode`: `serial|parallel`
-- `use_worktree`: boolean（通常 `parallel => true`；也允许串行仍使用 worktree）
-- `worktree_dir`（使用 worktree 时必须有；用于续跑/换人复用）
-- `branch`（如 `milestone/<milestone_id>`）
-- `result`（DONE 时写入：简短设计总结 + 关键 commits + tests + 新规则）
+```python
+def main(user_request):
+    while True:
+        # ── 外层：需求 → milestone ──
+        milestones = decompose(user_request)            # §3.1
+        if len(milestones) > 3:
+            milestones += acceptance_milestone()         # §3.1.1
+        write_all_to_dev_tasks(milestones)
 
----
+        # ── 内层：执行全部 milestone 直到完成 ──
+        while has_unfinished(milestones):
+            ready = get_ready_and_deps_satisfied()
+            parallel, serial = classify_by_conflict(ready)  # §3.1.2
 
-## 4) 只用两类操作：get / update（使用内置脚本）
+            for m in parallel:    # 同时派发
+                dispatch(m)       # §3.2（含子 skill 输入契约）
+            for m in serial:
+                dispatch(m)
 
-为避免并发写穿：
-- 所有对 `data/dev-tasks.json` 的写入必须通过本技能内置脚本（已内建目录锁 + 原子写）。
-- 不需要 heartbeat；用 `status_changed_at` + 直接询问 sub agent 进度即可。
+            monitor_all()         # §3.3
+            verify_completed()    # §3.4（含 worktree 清理检查）
+            handle_failures()     # §3.5
 
-本技能已内置脚本（带锁、原子写、校验迁移、自动 reconcile）。不要手改 `data/dev-tasks.json`、不要另写脚本，直接调用它：
-
-- Script: `/Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py`
-- `get`：读取全部/单个 Milestone
-- `update`：更新单个 Milestone 并自动 reconcile
-
-示例：
-
-```bash
-python3 /Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py get --path data/dev-tasks.json
-python3 /Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py get --path data/dev-tasks.json --milestone-id M12
-python3 /Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py get --path data/dev-tasks.json --status READY
-python3 /Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py get --path data/dev-tasks.json --status RUNNING,BLOCKED
-python3 /Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py update --path data/dev-tasks.json --milestone-id M12 --status RUNNING --claimed-by "agent-1"
-python3 /Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py update --path data/dev-tasks.json --milestone-id M12 --status DONE --result-json '{"solution_summary":"...","tests":"pytest -q"}'
+        # ── 外层：检查产品验收结果 ──
+        report = read_acceptance_report()
+        if report.verdict == "pass":
+            sweep_leftover_worktrees()  # §3.6 最终清理
+            break
+        else:
+            user_request = report.issues  # 问题转新 milestone，回到外层
 ```
 
-`update` 语义（脚本已实现）：
-- `READY -> RUNNING`（claim）
-- `RUNNING -> DONE|BLOCKED|FAILED`
-- `RUNNING -> READY`（release / 换人 / 回收）
-- 自动 reconcile：当某 Milestone `DONE` 时，移除其他任务 `blocked_by` 中的该 id；若 `blocked_by` 为空且此前为依赖阻塞，则置为 `READY`。
-
 ---
 
-## 5) 主循环（Milestone 粒度）
+## §3 步骤展开
 
-### 5.0 初期规划补强：产品级验收 Milestone（硬规则）
+### §3.1 需求分解（decompose）
 
-当你为一个新需求做初期 Milestone 拆分时，按下面规则处理：
-- 若总数预计超过 3 个 Milestone，默认在最后额外加 1 个“验收” Milestone。
-- 这个验收 Milestone 做“真实端到端联调 + 交互审视”，不是重复跑测试。
-- 验收要从整个产品角度看结果，结合用户要求检查主链路、状态提示、异常反馈、交互体验是否成立。
-- `goal/exit_criteria` 里要明确写出：验证链路、输出问题清单、给出后续改进项。
+将需求拆成 milestone，写入 dev-tasks.json。
 
-### 5.1 用户随时下发新任务（不中断运行中 Milestone）
+**颗粒度规则（硬规则）：**
 
-用户可能在你调度期间随时下发新需求。默认规则：
-- 不暂停、不重置、不回收任何 `status=RUNNING` 的 Milestone（除非用户明确要求“停止/改当前 Milestone/紧急插队”）。
-- 默认不把新需求塞进正在 `RUNNING` 的 Milestone：一律新建 Milestone 并用 `blocked_by` 表达顺序。
-- 你要把新需求增量写入 `data/dev-tasks.json`：拆成 1+ 个新 Milestone，补齐 `title/goal/exit_criteria`，并用 `blocked_by` 表达依赖/顺序（含“冲突风险高需要串行”的软依赖）。
-- 若新需求会改变既有未开始 Milestone 的顺序/依赖：同步更新那些 Milestone 的 `blocked_by/status`（但不要动 `RUNNING`）。
-- 若依赖还没想清：把 `blocked_by` 设为 `null`（pending）并标记 `status=BLOCKED`，等待你后续补齐依赖再自动解锁。
+| 情况 | 做法 | 原因 |
+|------|------|------|
+| 同模块/同页面多个小 bug | 合并为一个 milestone | 拆太细 → 合并冲突 + 多 agent 浪费 token，每个只改几行 |
+| 大需求涉及多个独立模块 | 按模块/文件边界拆成多个 milestone 并行 | 拆太粗 → 没有并行度，一个 agent 跑很久 |
+| 两个 milestone 改同一批文件 | 用 blocked_by 串行，或合并为一个 | 避免合并冲突 |
+| 纯配置/文档/样式修改 | 可合并到相关 milestone，不单独开 | 太轻量不值得开 agent |
 
-新增 Milestone 用 `--create`（可与 status/blocked_by 同命令完成）：
+**判断标准**：一个 milestone = "一个 sub agent 在一个 worktree 中能独立完成的一块工作"。太小（几行代码）或太大（需要数小时）都不对。
 
-```bash
-# 新需求=可立即并行：READY
-python3 /Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py update --path data/dev-tasks.json --milestone-id M13 --create --title "..." --goal "..." --exit-criteria "..." --status READY
+#### §3.1.1 验收 milestone
 
-# 新需求=依赖/需串行：BLOCKED + blocked_by
-python3 /Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py update --path data/dev-tasks.json --milestone-id M14 --create --title "..." --goal "..." --exit-criteria "..." --status BLOCKED --blocked-by "M12,M10"
+当 milestone 总数 > 3 时，在最后加一个产品验收 milestone：
+- skill: product-acceptance-reviewer
+- goal: 端到端联调 + 产品体验审视
+- exit_criteria: 验收报告通过，无 blocking/major 问题
+- blocked_by: 所有实现型 milestone
 
-# 新需求=依赖待定：BLOCKED + blocked_by=null(pending)
-python3 /Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py update --path data/dev-tasks.json --milestone-id M15 --create --title "..." --goal "..." --exit-criteria "..." --status BLOCKED --blocked-by-pending
+#### §3.1.2 并行判定
+
+- 改不同模块/文件 + 无依赖 → **并行**（默认）
+- 改同一批文件 或 有逻辑依赖 → blocked_by 串行
+- 不确定时 → 检查 allowed_scope 是否有交集；无交集就并行
+
+### §3.2 派发（dispatch）
+
+1. 解析主仓根目录：`repo_root=$(git rev-parse --show-toplevel)`
+2. 分配 worktree 路径：`worktree_dir=$repo_root/.worktrees/<milestone_id>`
+3. 更新 dev-tasks.json：status=RUNNING, claimed_by, worktree_dir, branch=milestone/<mid>
+4. 用 Agent 工具派发 sub agent：
+   - **不设置 `isolation` 参数**（再次强调：写了就错）
+   - prompt 中包含完整派发包（见下方契约）
+
+#### 实现型 milestone 派发包（tdd-execution-worker 输入契约）
+
+prompt 中必须包含以下全部字段：
+
+```yaml
+milestone_id: M<id>
+title: <标题>
+goal: <目标>
+exit_criteria: <退出标准>
+execution_mode: serial|parallel
+use_worktree: true|false
+worktree_dir: <绝对路径>/.worktrees/<mid>
+branch: milestone/<mid>
+test_command: <测试命令>
+allowed_scope: <允许改动的文件/目录列表>
+forbidden_scope: <禁止改动的文件/目录列表>
+prevention_rules: <从 LOGBOOK 提取的相关经验>
+dev_tasks_path: data/dev-tasks.json
 ```
 
-写入后立刻回到主循环，不要因为新增任务而中断既有派发与监控。
+同时在 prompt 中注明使用 skill：`/Users/czj/.codex/skills/tdd-execution-worker/SKILL.md`
 
-### 5.1.1 验收失败后的扩编闭环（硬规则）
+#### 产品验收 milestone 派发包（product-acceptance-reviewer 输入契约）
 
-产品级验收要形成闭环：
-- 验收发现问题时，把问题转成新的 Milestone，写回 `data/dev-tasks.json`。
-- 产品级验收 sub agent 只返回问题清单与验收报告；由你负责判断如何拆成后续 Milestone 并写回 `data/dev-tasks.json`。
-- 原验收 Milestone 先不要标记 `DONE`；等这些新 Milestone 完成后，再回来用最新代码仓续跑agent或重跑agent验收。
-- 验收结果至少要写清：通过项、问题清单、需要你进一步规划的后续工作。
-- 只有复验后没有新问题，验收 Milestone 才能 `DONE`。
+prompt 中必须包含以下全部字段：
 
-### 5.2 调度范围（Scope）
+```yaml
+milestone_id: M<id>
+title: <标题>
+scope: <本次验收的功能范围>
+journeys: <要体验的用户旅程列表>
+requirements: <相关需求/SPEC/README 路径>
+launch_instructions: <如何启动/访问产品>
+out_of_scope: <明确不验收的内容>
+acceptance_bar: 无 blocking/major 问题
+```
 
-主循环开始前先确定“本项目负责人调度 agent 的负责范围”：
-- 若用户/上级 agent 明确点名 Milestone 列表：只从这些 Milestone 中挑 `READY` 且依赖满足者派发；其他 Milestone 即使 READY 也不动。
-- 若未点名且用户要求“把 board 全部跑完”：才对全量 Milestone 执行主循环。
+强调：只做产品判断和真实体验，不修代码、不改 dev-tasks.json。
 
-1. `get` 找到所有 `status=READY` 且依赖已满足（`blocked_by` 全 DONE/为空）的 Milestone  
-2. 做并行判定：无依赖、冲突风险低的 Milestone 才并行派发  
-3. 对每个要派发的 Milestone，`update`：
-   - 写 `execution_mode/use_worktree`
-   - 若未分配则先解析主仓根目录 `repo_root=$(git rev-parse --show-toplevel)`，再写 `worktree_dir="$repo_root/.worktrees/<milestone_id>"` 与 `branch`（保证可复用）
-   - `status=RUNNING`，写 `claimed_by/status_changed_at/updated_at`
-4. 派发 sub agent（按 Milestone 类型选择 skill）：
-   - 实现型 Milestone：派发 `/Users/czj/.codex/skills/tdd-execution-worker/SKILL.md`
-   - 产品级验收 Milestone：派发 `/Users/czj/.codex/skills/product-acceptance-reviewer/SKILL.md`
-   - 任务单位：整个 Milestone（同一 sub agent 在同一 worktree 内完成该 Milestone 的工作）
-   - 若使用 Claude Code 的 Agent 工具：`isolation` 保持默认，严禁设置成 `worktree`！严禁设置成 `worktree`。它的worktree逻辑和本skill冲突！
-   - 若是实现型 Milestone：派发包必须包含 execution worker 的输入契约字段（尤其 `test_command`）
-   - 若是产品级验收 Milestone：派发包必须包含本次要体验的功能范围、相关需求/SPEC/README/运行说明、建议入口、明确 out-of-scope；并强调该 sub agent 只做产品 judgment / 真实体验 / 验收报告，不修代码、不读大段实现、不改 `dev-tasks.json`
-   - 默认“一个 Milestone 一个 sub agent”，不要让同一个 sub agent 接连跑多个 Milestone
-5. 监控：
-   - 不要太着急回收/kill sub agent。判断依据优先用“是否有产物落盘”，而不是是否即时回复。
-   - 频率建议：每隔一段时间做一轮（例如 2-5 分钟/轮）。只要能看到持续有产物落盘，就认为它在工作中。
-   - 一轮监控建议做两件事：
-     - 在对应的worktree看产物是否在落盘：`TASKS/<milestone_id>-*.md`、`PROGRESS/<milestone_id>-*.md` 是否有新增/更新；Milestone 分支是否有新 commit；worktree 是否有新增文件。
-     - 没有的话，再 ping sub agent（可选）：询问“当前 Roadpoint/卡点/下一步/预计多久给下一次落盘产物”。
-   - 若没有产物落盘且 ping 无任何回应：再等待一轮（让出时间给它继续工作）。
-   - 只有当“至少超过10分钟没有任何落盘产物 + 多次 ping 无回应”时，才认为 sub agent 可能死亡：
-     - 先关闭该 sub agent
-     - 再 `update` 将其 `RUNNING -> READY` 并清 claim（保留 `worktree_dir/branch`）
-     - 然后派新 sub agent 续跑同一 worktree
-6. 直到没有 READY 的 Milestone：结束
+同时在 prompt 中注明使用 skill：`/Users/czj/.codex/skills/product-acceptance-reviewer/SKILL.md`
+
+### §3.3 监控（monitor）
+
+频率：每 2-5 分钟一轮。
+
+每轮：
+1. 检查 worktree 中 TASKS/PROGRESS 是否有更新、milestone 分支是否有新 commit
+2. 有产物 → 正常工作中，不打扰
+3. 无产物 → ping sub agent 询问进度
+4. **超过 10 分钟无产物 + 多次 ping 无回应** → 判定死亡 → §3.5 处理
+
+### §3.4 验收（verify）
+
+sub agent 声称完成时，逐项检查：
+
+**通用检查项：**
+- [ ] main 已合并该 milestone 分支
+- [ ] TASKS/<mid>-\*.md 中 roadpoints 全 DONE
+- [ ] PROGRESS/<mid>-\*.md 每个 roadpoint 有结构化记录（Context/Decision/Evidence/Commits）
+- [ ] dev-tasks.json 中 status=DONE 且有 result
+- [ ] **worktree 已清理**（sub agent 应已删除；如未清理，你执行 `git worktree remove <dir>` + `git branch -d <branch>`）
+
+**产品验收额外检查：**
+- [ ] ACCEPTANCE/<mid>-acceptance.md 存在且结构完整
+- [ ] 有端到端联调结论（不只是测试通过）
+- [ ] result 包含产品视角结论和问题清单
+
+任一项不满足 → 要求 sub agent 补齐（不要代写）。
+
+### §3.5 纠偏/回退/换人
+
+| 情况 | 处理 |
+|------|------|
+| sub agent 卡住某个 roadpoint | 要求回退到上一稳定 commit，拆小重做 |
+| sub agent 死亡（§3.3 判定） | 关闭 agent → RUNNING→READY（保留 worktree/branch）→ 派新 agent 续跑同一 worktree |
+| 验收失败 | 问题转新 milestone → 写入 dev-tasks.json → 回到内层循环 |
+| 验收 milestone 失败 | 不标 DONE → 新 milestone 修完后重派验收 |
+
+换人续跑时：要求新 sub agent 先读 TASKS/PROGRESS/LOGBOOK 再继续。
+
+### §3.6 Worktree 生命周期
+
+| 阶段 | 操作 | 责任方 |
+|------|------|--------|
+| 创建 | `git worktree add -b <branch> .worktrees/<mid>` | sub agent |
+| 使用中 | symlink data/dev-tasks.json 和 data/locks/ 到主仓 | sub agent |
+| 完成 | `git worktree remove` + `git branch -d` | sub agent |
+| 验收时 | 检查是否已清理，未清理则主 agent 清理 | 主 agent |
+| 外层循环结束 | 扫描 `.worktrees/` 清理所有残留 | 主 agent |
+
+**路径硬规则：**
+- 所有 worktree 在 `$(git rev-parse --show-toplevel)/.worktrees/<mid>`
+- 必须用绝对路径
+- 禁止嵌套（不在 worktree 内再创建 worktree）
+- data/dev-tasks.json 是 gitignored 运行态文件，worktree 内的 symlink 也不得提交
 
 ---
 
-## 6) 纠偏、回退与换人（工作区复用）
+## §4 用户随时下发新任务
 
-### 6.1 sub agent 搞不定某 Roadpoint
-- 要求其在同一 worktree 内回退到最近稳定可工作的 commit（通常是上一 Roadpoint 的 C3），拆小并重做。
-- 强制其把“卡点/尝试/下一步”写进 `PROGRESS/<milestone_id>-<简述>.md`，必要时追加 `LOGBOOK.md`。
+不暂停/不重置任何 RUNNING 的 milestone（除非用户明确要求）。
 
-### 6.2 sub agent 死亡或连续跑偏
-- 先按第 5 节监控策略确认其确实“无产物落盘 + 无回应”，再关闭该 sub agent（避免误杀正在工作的 sub agent）。
-- `update` 释放该 Milestone（`RUNNING -> READY`，清 claim，保留 worktree_dir/branch）。
-- 派发新 sub agent，并要求其复用该 worktree，先阅读 `TASKS/PROGRESS/LOGBOOK` 再继续。
-
----
-
-## 7) 验收清单（主 agent）
-
-当 sub agent 声称完成 Milestone 时，按最小清单验收：
-- `main` 已合并该 Milestone 分支（并已 push）
-- `TASKS/<milestone_id>-<简述>.md`：Roadpoints 全 DONE，且每个 Roadpoint 的 Tests Plan/DoD 已满足
-- `PROGRESS/<milestone_id>-<简述>.md`：每个 Roadpoint 都有结构化记录（Context/Decision/Rationale/Evidence/Rollback/Commits/Next），且 Evidence 包含 `test_command` 全绿 + 入口验证一句
-- `data/dev-tasks.json`：该 Milestone `status=DONE`，并写入 `result`（solution_summary/tests/commits/新经验）
-- 若 `use_worktree=true`：对应 `worktree_dir` 必须被清理（`git worktree remove <worktree_dir>`）；若 sub agent 未清理，则由你清理
-
-若任一项不满足：要求 sub agent 补齐（不要由你代写）。
-
-若当前是“产品级验收” Milestone，再追加以下硬性口径：
-- Evidence 必须包含真实入口的端到端联调结论，不只是测试通过。
-- 必须存在 `ACCEPTANCE/<milestone_id>-acceptance.md`（或等价命名的验收报告），且其中包含：`Scope / Materials Read / User Journeys Exercised / Passes / Issues / Retest Focus`。
-- `result` 必须写产品视角的审视结论和问题清单。
-- 若还有明显问题，本 Milestone 不得 `DONE`；先新增后续 Milestone，做完后再复验。
+处理方式：
+1. 新需求 → 拆成新 milestone → 写入 dev-tasks.json（用 `--create`）
+2. 用 blocked_by 表达依赖/顺序
+3. 若影响未开始 milestone 的依赖 → 同步更新 blocked_by（不动 RUNNING 的）
+4. 回到内层循环继续
 
 ---
 
-## 8) 主 agent 上下文策略（省上下文但不丢控制）
+## §5 工具与文件
 
-- 主线程只保留：未完成 Milestone 列表、每个 Milestone 的 goal/exit_criteria、最近一次纠偏决策
-- 不粘贴大段实现细节/测试日志；证据写进 `PROGRESS/<milestone_id>-<简述>.md` 与 `data/dev-tasks.json` 中该 Milestone 的 `result` 字段（`milestones[].result`）
-- 任何“新坑/预防规则”优先沉淀到 `LOGBOOK.md`，并在下次派发时注入 `prevention_rules`
+### §5.1 关键文件
+
+| 文件 | 用途 | 谁写 |
+|------|------|------|
+| data/dev-tasks.json | milestone 调度板（gitignored） | 脚本 |
+| TASKS/<mid>-\*.md | roadpoint 计划 | sub agent |
+| PROGRESS/<mid>-\*.md | 实现记录/证据 | sub agent |
+| ACCEPTANCE/<mid>-\*.md | 验收报告 | acceptance reviewer |
+| LOGBOOK.md | 跨任务经验 | 主/sub |
+| ROADMAP.md | 用户长期规划 | 用户（只读） |
+
+缺失文件：TASKS/PROGRESS/data/locks/ → `mkdir -p`；LOGBOOK/ROADMAP → `touch`；dev-tasks.json → 脚本自动初始化。
+
+### §5.2 dev-tasks.json 脚本
+
+脚本路径：`/Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py`
+
+```bash
+# 读取
+python3 <script> get --path data/dev-tasks.json
+python3 <script> get --path data/dev-tasks.json --milestone-id M12
+python3 <script> get --path data/dev-tasks.json --status READY
+
+# 更新状态
+python3 <script> update --path data/dev-tasks.json --milestone-id M12 --status RUNNING --claimed-by "agent-1"
+
+# 完成
+python3 <script> update --path data/dev-tasks.json --milestone-id M12 --status DONE --result-json '{"solution_summary":"...","tests":"..."}'
+
+# 新建（可立即执行）
+python3 <script> update --path data/dev-tasks.json --create \
+  --title "..." --goal "..." --exit-criteria "..." --status READY
+
+# 新建（有依赖）
+python3 <script> update --path data/dev-tasks.json --create \
+  --title "..." --goal "..." --exit-criteria "..." --status BLOCKED --blocked-by "M12,M10"
+
+# 新建（依赖待定）
+python3 <script> update --path data/dev-tasks.json --create \
+  --title "..." --goal "..." --exit-criteria "..." --status BLOCKED --blocked-by-pending
+```
+
+自动 reconcile：milestone DONE 时，自动清除其他任务 blocked_by 中的该 id，空则提升为 READY。
+
+### §5.3 dev-tasks.json 字段
+
+每个 milestone：`milestone_id, title, goal, exit_criteria, status, blocked_by, claimed_by, status_changed_at, updated_at, execution_mode, use_worktree, worktree_dir, branch, result`
+
+Status 流转：READY→RUNNING→DONE | READY→BLOCKED→READY | RUNNING→READY（释放）| RUNNING→FAILED
+
+---
+
+## §6 上下文策略
+
+- 主线程只保留：未完成 milestone 列表 + goal/exit_criteria + 最近纠偏决策
+- 不粘贴大段日志；证据在 PROGRESS 和 result 中
+- 新经验沉淀到 LOGBOOK.md，下次派发注入 prevention_rules

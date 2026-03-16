@@ -26,6 +26,7 @@ def _default_dev_tasks_payload() -> dict[str, Any]:
     return {
         "_note": f"Runtime file (gitignored). Update via: python3 {script_path} ...",
         "version": 1,
+        "max_milestone_seq": 0,
         "milestones": [],
     }
 
@@ -146,6 +147,11 @@ def _load_json(path: Path) -> dict[str, Any]:
     milestones = data.get("milestones")
     if not isinstance(milestones, list):
         raise DevTasksError("dev-tasks.json must contain 'milestones' as a list")
+    max_milestone_seq = data.get("max_milestone_seq")
+    if max_milestone_seq is None:
+        data["max_milestone_seq"] = 0
+    elif not isinstance(max_milestone_seq, int) or max_milestone_seq < 0:
+        raise DevTasksError("dev-tasks.json 'max_milestone_seq' must be a non-negative integer")
     return data
 
 
@@ -191,6 +197,12 @@ def _normalize_blocked_by(value: Any) -> list[str] | None:
                 out.append(item)
         return _unique(out)
     raise DevTasksError("blocked_by must be a list of strings or null")
+
+
+def _allocate_next_milestone_id(data: dict[str, Any]) -> str:
+    next_seq = data["max_milestone_seq"] + 1
+    data["max_milestone_seq"] = next_seq
+    return f"M{next_seq}"
 
 
 def _reconcile(data: dict[str, Any]) -> int:
@@ -301,19 +313,22 @@ def cmd_update(args: argparse.Namespace) -> int:
         data = _load_json(real_path)
         milestones: list[dict[str, Any]] = data["milestones"]
 
-        found = _find_milestone(milestones, args.milestone_id)
-        now = _now_iso()
-        action = "更新"
+        if args.create and args.milestone_id is not None:
+            raise DevTasksError("--create does not accept --milestone-id; milestone IDs are auto-generated")
+        if not args.create and not args.milestone_id:
+            raise DevTasksError("update requires --milestone-id unless --create is used")
 
-        if not found:
-            if not args.create:
-                raise DevTasksError(
-                    f"milestone_id not found: {args.milestone_id} (use --create to create a new milestone)"
-                )
+        milestone_id = args.milestone_id
+        found = _find_milestone(milestones, milestone_id) if milestone_id else None
+        now = _now_iso()
+        action = "updated"
+
+        if args.create:
             if not args.title or not args.goal or not args.exit_criteria:
                 raise DevTasksError("--create requires --title, --goal, and --exit-criteria")
-            milestone: dict[str, Any] = {
-                "milestone_id": args.milestone_id,
+            milestone_id = _allocate_next_milestone_id(data)
+            milestone = {
+                "milestone_id": milestone_id,
                 "title": args.title,
                 "goal": args.goal,
                 "exit_criteria": args.exit_criteria,
@@ -325,8 +340,12 @@ def cmd_update(args: argparse.Namespace) -> int:
                 "updated_at": now,
             }
             milestones.append(milestone)
-            action = "创建并更新"
+            action = "created"
         else:
+            if not found:
+                raise DevTasksError(
+                    f"milestone_id not found: {milestone_id} (use --create to create a new milestone)"
+                )
             _, milestone = found
 
         before_status = milestone.get("status")
@@ -427,7 +446,17 @@ def cmd_update(args: argparse.Namespace) -> int:
             _reconcile(data)
 
         _write_json_atomic(real_path, data)
-        print(f"{action}成功: {args.milestone_id}")
+        print(
+            json.dumps(
+                {
+                    "action": action,
+                    "milestone_id": milestone_id,
+                    "milestone": milestone,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return 0
     finally:
         _release_lock(lock)
@@ -455,8 +484,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_update.add_argument("--lock-dir", help="Lock dir path (default: <dev-tasks-dir>/locks/dev-tasks.lock)")
     p_update.add_argument("--lock-timeout-s", type=float, default=30.0, help="Lock acquisition timeout seconds")
 
-    p_update.add_argument("--milestone-id", required=True, help="Milestone id, e.g. M12")
-    p_update.add_argument("--create", action="store_true", help="Create milestone if missing")
+    p_update.add_argument("--milestone-id", help="Milestone id, e.g. M12 (required unless --create is used)")
+    p_update.add_argument("--create", action="store_true", help="Create a new milestone with an auto-generated id")
 
     p_update.add_argument("--title")
     p_update.add_argument("--goal")
