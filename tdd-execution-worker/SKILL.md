@@ -87,6 +87,7 @@ description: 子 agent 执行面技能。接收主 agent 派发的一个 Milesto
 ### 4.2 Plan（只做一次）
 
 在同一 worktree/分支中 explore repo 后：
+0. 确认有无SPEC文档，有的话读取与本milestone相关的文档内容，plan和实现要遵守SPEC。
 1. 生成 `TASKS/<milestone_id>-<简述>.md`：
    - Roadpoint 列表（R1/R2/…）
    - 每个 Roadpoint 必填：
