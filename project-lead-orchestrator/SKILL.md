@@ -259,6 +259,10 @@ python3 <script> update --path data/dev-tasks.json --create \
 
 自动 reconcile：milestone DONE 时，自动清除其他任务 blocked_by 中的该 id，空则提升为 READY。
 
+# 删除过时任务（不可恢复）
+python3 <script> delete M13 M14
+python3 <script> delete M15 --force   # 强制删除 RUNNING 状态的任务
+
 ### §5.3 dev-tasks.json 字段
 
 每个 milestone：`milestone_id, title, goal, exit_criteria, status, blocked_by, claimed_by, status_changed_at, updated_at, execution_mode, use_worktree, worktree_dir, branch, result`

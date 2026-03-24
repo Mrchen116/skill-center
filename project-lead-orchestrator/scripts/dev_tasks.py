@@ -304,6 +304,42 @@ def cmd_get(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_delete(args: argparse.Namespace) -> int:
+    real_path = _resolve_real_path(Path(args.path))
+    lock_dir = Path(args.lock_dir) if args.lock_dir else (real_path.parent / "locks" / "dev-tasks.lock")
+    lock = _acquire_lock(lock_dir, timeout_s=30.0)
+    try:
+        _ensure_dev_tasks_file(real_path)
+        data = _load_json(real_path)
+        milestones: list[dict[str, Any]] = data["milestones"]
+
+        ids_to_delete: set[str] = set(args.milestone_ids)
+
+        # Safety check: refuse to delete RUNNING milestones unless --force
+        if not args.force:
+            running = [m["milestone_id"] for m in milestones
+                       if m.get("milestone_id") in ids_to_delete and m.get("status") == "RUNNING"]
+            if running:
+                raise DevTasksError(
+                    f"Refusing to delete RUNNING milestones: {running}. "
+                    "Release them first (status=READY) or use --force."
+                )
+
+        before_count = len(milestones)
+        data["milestones"] = [m for m in milestones if m.get("milestone_id") not in ids_to_delete]
+        deleted = before_count - len(data["milestones"])
+
+        if deleted == 0:
+            raise DevTasksError(f"No milestones found with ids: {sorted(ids_to_delete)}")
+
+        _write_json_atomic(real_path, data)
+        print(json.dumps({"action": "deleted", "count": deleted, "ids": sorted(ids_to_delete)},
+                         ensure_ascii=False, indent=2))
+        return 0
+    finally:
+        _release_lock(lock)
+
+
 def cmd_update(args: argparse.Namespace) -> int:
     real_path = _resolve_real_path(Path(args.path))
     lock_dir = Path(args.lock_dir) if args.lock_dir else (real_path.parent / "locks" / "dev-tasks.lock")
@@ -478,6 +514,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated statuses to filter by (READY|RUNNING|DONE|BLOCKED|FAILED). Mutually exclusive with --milestone-id.",
     )
     p_get.set_defaults(func=cmd_get)
+
+    p_delete = sub.add_parser("delete", help="Delete one or more milestones by id")
+    p_delete.add_argument("--path", default="data/dev-tasks.json")
+    p_delete.add_argument("--lock-dir")
+    p_delete.add_argument("milestone_ids", nargs="+", help="Milestone ids to delete, e.g. M12 M13")
+    p_delete.add_argument("--force", action="store_true", help="Allow deleting RUNNING milestones")
+    p_delete.set_defaults(func=cmd_delete)
 
     p_update = sub.add_parser("update", help="Update a milestone (status/fields) and auto-reconcile")
     p_update.add_argument("--path", default="data/dev-tasks.json", help="Path to dev-tasks.json (may be a symlink)")
