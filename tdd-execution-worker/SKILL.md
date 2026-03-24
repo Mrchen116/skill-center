@@ -1,238 +1,275 @@
 ---
 name: tdd-execution-worker
-description: 子 agent 执行面技能。接收主 agent 派发的一个 Milestone，在同一 worktree/分支内完成：一次性拆 Roadpoints（写入 TASKS/PROGRESS）、逐点按 C1/C2/C3 完成、必要时回退重试/交接，最终将 Milestone 整体合并到 main 并更新 dev-tasks.json 状态。
+description: 用于作为 subagent 执行单个 Milestone 的编码实现。触发条件：被 project-lead-orchestrator 派发一个含 milestone_id/goal/exit_criteria/test_command 的派发包，需要在 worktree 中完成 TDD 三提交循环（C1测试/C2实现/C3文档）并合并到 main。不要用于：调度多个 milestone（用 orchestrator）、不需要 TDD 流程的简单修改。
 ---
 
 # TDD Execution Worker
 
-## 1) 输入契约（必须有，任务单位=Milestone）
+## §0 硬规则（违反即失败）
 
-开始前检查派发包字段（缺失则先向主 agent 补齐）：
-- `milestone_id`
-- `title`
-- `goal`
-- `exit_criteria`
-- `execution_mode` (`serial|parallel`)
-- `use_worktree` (`true|false`)
-- `worktree_dir`（use_worktree=true 时必须提供）
-- `branch`（如 `milestone/<milestone_id>`）
-- `test_command`
-- `allowed_scope` / `forbidden_scope`
-- `prevention_rules`
-- `dev_tasks_path`（默认 `data/dev-tasks.json`，worktree 内必须指向主仓共享那份）
+### 编码原则
 
----
+1. **遵循 SPEC 和项目架构**：先读相关 SPEC 文档和现有代码结构，在项目既有架构内实现。不要"哪能跑就在哪写"，不要为了最小改动而放错位置。正确的做法是最符合框架设计意图的做法，不是改动行数最少的做法。
+2. **禁止兜底/降级/防御性编程**：Avoid degradation handling, fallback, hacks, heuristics, local stabilizations, or post-processing bandages that are not faithful general algorithms. 兜底代码不只是屎山——它会造成数据静默错误而你完全不知道。错误应该大声失败（raise/assert），不要静默吞掉。
+3. **禁止超范围改动**：只改 `allowed_scope` 内的文件；`forbidden_scope` 内的文件不得修改。
 
-## 2) 启动动作（固定）
+### 测试原则
 
-1. 先读 `LOGBOOK.md`（主动，拆坑经验库）：把相关坑/规则加入本 Milestone 注意事项  
-2. 读 `COMMENTING_GUIDE.md` 并承诺遵守其中的注释/评论规范（后续写代码与写文档均以此为准）  
-3. 复述当前处境：
-   - Milestone（id/title）
-   - execution_mode / 是否 worktree / worktree_dir / branch
-   - 测试门禁命令
-   - 允许/禁止改动范围
-4. 应用 `prevention_rules`（主 agent 注入）  
-5. 跑一次 `test_command` 建立基线（若已失败：先向主 agent 说明“失败原因/是否纳入本 Milestone scope”再继续）  
-6. 再开始执行
+4. **测试必须证明产品能用，不是证明代码能跑**：单元测试全绿 ≠ 产品能用。历史教训：M250 每个组件的单元测试都过了，但 send_message 在真实系统中根本不能用；M248 单元测试全绿，但 session 在 gateway 重启后实际丢失。原因都是测试只 mock 了内部函数，没有走真实入口。
+5. **新功能必须有真实入口测试**：至少一个测试走真实产品入口（浏览器/CLI/HTTP endpoint），证明用户真的能用。不接受"全是 mock 的单元测试全绿"作为完成依据。
+6. **Bug 修复 / 重构：补足现有测试，不要新建一堆**：优先修改现有测试文件，补充缺失的断言或场景。不要为每个小修改都新建测试文件。
+7. **不要为了测试而测试**：每个测试必须证明现有测试没覆盖的东西。重复/无用的测试该删就删。测试数量不是目标，覆盖真实行为才是。
+
+### 流程规则
+
+8. **强制三提交**：每个 Roadpoint 必须 C1（测试）→ C2（实现）→ C3（文档），不得合并或跳过。
+9. **测试门禁**：C2 提交前必须 `test_command` 全绿。
+10. **不手改 dev-tasks.json**：所有写操作通过内置脚本。
+11. **Worktree 路径锚定主仓**：`$(git rev-parse --show-toplevel)/.worktrees/<mid>`，禁止用相对路径、禁止嵌套 worktree。
 
 ---
 
-## 3) Roadpoint 执行标准（强制三提交）
+## §1 输入契约
 
-每个 Roadpoint 必须严格执行：
+开始前检查派发包（缺失字段向主 agent 补齐）：
 
-1. Red：先写测试并用 `test_command`（或该 Roadpoint 的最小子集）确认“失败点=当前缺失能力/bug”  
-2. C1：仅提交测试  
-3. Green：最小实现让测试通过  
-4. Refactor：行为不变重构（如需改行为，先补测试再改代码）  
-5. 全绿门禁：在 C2 前必须再次运行 `test_command` 并确认全绿  
-6. C2：提交实现/重构  
-7. 更新文档：
-   - 必更：`TASKS/<milestone_id>-<简述>.md`、`PROGRESS/<milestone_id>-<简述>.md`
-   - 选更：仅当你发现“可复用的坑/预防规则/关键经验”时才追加 `LOGBOOK.md`（不要把实现思路/决策流水写进 LOGBOOK；写进 PROGRESS）
-8. C3：仅提交文档
-
-提交语义：
-- C1: `test(Rx.y): ...（先红）`
-- C2: `feat|fix|refactor(Rx.y): ...（全绿）`
-- C3: `docs(Rx.y): ...（记录hash/证据/下一步）`
-
-约定：冒号 `:` 后的描述必须用中文，且尽量短、具体、可验收。
-
----
-
-## 4) 任务生命周期（一个 Milestone 一口气做完）
-
-### 4.1 工作区准备（按 use_worktree）
-
-#### use_worktree=false（串行）
-- 在当前仓库新建并切到分支：`<branch>`
-
-#### use_worktree=true（并行/隔离）
-0. 先解析主仓根目录：`repo_root=$(git rev-parse --show-toplevel)`
-   - 即使当前 shell 已经身处某个 worktree，也必须以 `repo_root` 为锚点；禁止用 `pwd`、相对路径或“当前目录”推导新的 `worktree_dir`
-   - 默认约定：`worktree_dir="$repo_root/.worktrees/<milestone_id>"`
-   - 禁止在已有 `.claude/worktrees/...`、`.worktrees/...` 或任何其他 worktree 目录内部，再创建新的 agent worktree / milestone worktree
-1. 如果 `worktree_dir` 已存在：直接进入复用（用于换人/续跑）  
-2. 否则创建 worktree：
-   - 先确认 `worktree_dir` 是位于 `repo_root/.worktrees/` 下的绝对路径
-   - 再执行 `git -C "$repo_root" worktree add -b <branch> <worktree_dir>`
-3. 在 worktree 中确保共享派工板：
-   - `data/dev-tasks.json` 必须 symlink 到主仓同一份（避免状态分叉）
-   - 锁目录（如 `data/locks/`）也必须共享（symlink 或使用主仓绝对路径）
-
-> 注意：`dev-tasks.json` 是运行态文件，必须 `gitignore`，不得提交到 git；worktree 内的 symlink 也不得提交到 git。
-
-### 4.2 Plan（只做一次）
-
-在同一 worktree/分支中 explore repo 后：
-0. 确认有无SPEC文档，有的话读取与本milestone相关的文档内容，plan和实现要遵守SPEC。
-1. 生成 `TASKS/<milestone_id>-<简述>.md`：
-   - Roadpoint 列表（R1/R2/…）
-   - 每个 Roadpoint 必填：
-     - Acceptance（3-5 条）
-     - Tests Plan：默认四类 `unit/contract/integration/e2e`，写明本 Roadpoint 选哪些、不选哪些及原因
-     - Expected Tests：尽量写到“测试文件/测试名/入口形态”
-     - DoD：`test_command` 全绿 + C1/C2/C3 齐全 + PROGRESS 写清决策/证据/哈希
-     - 状态（TODO/DOING/DONE/BLOCKED）
-2. 生成/更新 `PROGRESS/<milestone_id>-<简述>.md`：
-   - 目的：把“当时为什么这么做”的关键决策固化下来，支持：
-     - 未来排障/演进时回溯设计意图
-     - sub agent 死亡/换人后快速续跑
-     - 主 agent 低成本验收（不需要粘贴大段日志）
-   - 要求：每个 Roadpoint 完成后必须补齐一条结构化记录（尽量每项 1-3 行）：
-     - `Context`：问题/约束/边界（含不做什么）
-     - `Decision`：最终方案（关键结构/API/协议点）
-     - `Rationale`：为什么这样做（取舍/替代方案一句）
-     - `Evidence`：`test_command` 全绿 + 入口验证一句 + 关键约束/边界
-     - `Rollback`：若要重做，应回退到哪个稳定 commit（通常 C1 或上一 Roadpoint 的 C3）
-     - `Commits`：`C1` / `C2` / `C3`
-     - `Next`
-     - 模板（直接 copy，保持简短即可）：
-
-       ```md
-       ### Rx.y <Roadpoint 标题>
-       - Context:
-       - Decision:
-       - Rationale:
-       - Evidence:
-         - Tests: <test_command>
-         - Entry: <一句入口验证>
-       - Rollback:
-       - Commits: C1=<...>, C2=<...>, C3=<...>
-       - Next:
-       ```
-3. 提交一次计划提交（不算 Roadpoint 的 C1/C2/C3）
-4. 推荐 `git push -u origin <branch>`（保存现场，便于断网/换人恢复）
-
-#### Tests Plan：测试分层（默认四类）
-
-- unit：逻辑与边界，快速定位
-- contract：边界结构校验（字段/类型/必填/协议）；优先用项目现有机制（如 Pydantic / JSON Schema / OpenAPI 等）
-- integration：关键链路串联（配置 -> 构造 -> 处理 -> 解析 -> 副作用）
-- e2e：真实入口验证主流程，防止“单测全过但入口失败”
-
-#### Tests Plan：入口自适应（写进 TASKS 的 Tests Plan 里）
-
-- CLI：用 `subprocess` 跑真实命令行入口，断言退出码/输出/产物
-- HTTP：用测试客户端或启动服务发真实请求，断言响应与副作用
-- 库/算法：用 public API 跑完整用例，不用“私有函数单测”冒充 e2e
-
-### 4.3 Execute（Roadpoint 循环）
-
-对每个 Roadpoint（同一 sub agent、同一 worktree/分支）：
-1. 按第 3 节完成 C1/C2/C3 三提交  
-2. 不合并到 main（Milestone 作为整体合并）  
-3. 推荐在每个 Roadpoint 完成后：
-   - `git push`（保存现场，便于换人/回滚）
-   - 视情况 `git fetch origin && git rebase origin/main`（降低最终集成冲突；不是 merge）
-
-### 4.4 Milestone 完成后整体集成到 main
-
-当所有 Roadpoint DONE 且满足 `exit_criteria`：
-1. `git fetch origin`
-2. `git rebase origin/main`（冲突按第 5 节处理）
-3. 运行 `test_command`（必须全绿）
-4. 获取合并锁（`data/locks/merge.lock`，目录锁即可），确保同一时刻只合并一个 Milestone  
-5. 合并并 push（worktree 内无法 checkout main，必须先回主仓）：
-   - `repo_root=$(git rev-parse --show-toplevel)`
-   - `cd "$repo_root"`
-   - `git checkout main && git pull --rebase origin main`
-   - `git merge --no-ff <branch>`
-   - `git push origin main`
-6. 释放合并锁
-7. 用脚本更新 `data/dev-tasks.json`（不要手改），将该 Milestone 更新为 `DONE` 并写入 `result`：
-
-```bash
-python3 /Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py update --path data/dev-tasks.json --milestone-id "<milestone_id>" --status DONE --result-json '{"solution_summary":"...","tests":"...","commits":{"C1":"...","C2":"...","C3":"..."}}'
+```yaml
+milestone_id: M<id>
+title: <标题>
+goal: <目标>
+exit_criteria: <退出标准>
+execution_mode: serial|parallel
+use_worktree: true|false
+worktree_dir: <绝对路径>    # use_worktree=true 时必须
+branch: milestone/<mid>
+test_command: <测试命令>
+allowed_scope: <允许改动的文件/目录>
+forbidden_scope: <禁止改动的文件/目录>
+prevention_rules: <LOGBOOK 中的相关经验>
+dev_tasks_path: data/dev-tasks.json
 ```
 
-8. 清理（仅当 `use_worktree=true` 且 Milestone 已 `DONE`）：
-   - 退出 `worktree_dir`，在主仓执行：
-     - `git worktree remove <worktree_dir>`
-     - `git branch -d <branch>`（若提示未合并：说明集成未成功，停止并向主 agent 报告）
-   - 不要在“交接/释放（回到 READY/BLOCKED）”时清理 worktree；那会导致无法复用续跑。
+---
+
+## §2 主流程
+
+```python
+def execute_milestone(dispatch):
+    # ── 启动 ──
+    setup_worktree(dispatch)                    # §3.1
+    read_spec_and_logbook()                     # §3.1
+    run_test_baseline(dispatch.test_command)     # §3.1
+
+    # ── 规划 ──
+    roadpoints = plan(dispatch)                 # §3.2
+    write_tasks_and_progress()
+    commit_and_push("plan")
+
+    # ── 执行 ──
+    for rp in roadpoints:                       # §3.3
+        write_test(rp)                          # Red
+        commit("C1: test")
+        implement(rp)                           # Green + Refactor
+        assert test_command() == ALL_GREEN
+        commit("C2: impl")
+        update_tasks_and_progress(rp)
+        commit("C3: docs")
+        push()
+
+    # ── 集成 ──
+    rebase_on_main()                            # §3.4
+    assert test_command() == ALL_GREEN
+    acquire_merge_lock()
+    merge_to_main_and_push()
+    release_merge_lock()
+    update_dev_tasks(status=DONE)
+
+    # ── 清理 ──
+    remove_worktree()                           # §3.5
+    report_to_orchestrator()
+```
 
 ---
 
-## 5) 冲突处理（rebase 失败）
+## §3 步骤展开
 
-当 `git rebase origin/main` 失败时：
+### §3.1 启动
 
-1. 若是 `unstaged changes`：
-   - 先 `git add/commit` 或 `git stash`
-2. 若有 merge conflicts：
-   - `git status` 查看冲突文件
-   - 逐文件理解双方意图并手动解决
-   - `git add <resolved-files>`
-   - `git rebase --continue`
-3. 重复直到 rebase 完成
+**工作区准备：**
 
-禁止直接将任务标记失败后放弃。
+- `use_worktree=false`：在当前仓库切到 `<branch>`
+- `use_worktree=true`：
+  1. `repo_root=$(git rev-parse --show-toplevel)`
+  2. `worktree_dir` 已存在 → 直接进入复用（换人/续跑）
+  3. 不存在 → `git -C "$repo_root" worktree add -b <branch> <worktree_dir>`
+  4. 确保 `data/dev-tasks.json` symlink 到主仓（避免状态分叉）
+  5. 确保 `data/locks/` symlink 到主仓
+
+> dev-tasks.json 是 gitignored 运行态文件，worktree 内的 symlink 也不得提交。
+
+**读取上下文：**
+
+1. 读 `LOGBOOK.md`，提取相关经验加入注意事项
+2. 读 `COMMENTING_GUIDE.md`（如存在），遵守注释规范
+3. **读相关 SPEC 文档**：查找 `docs/`、`specs/` 或项目中与本 milestone 相关的设计文档，理解架构意图和接口约定
+4. 读现有代码结构，理解模块边界和职责划分
+5. **读现有测试结构**：了解项目已有哪些测试、测试文件的组织方式、已有的 fixture/helper，避免重复造轮子
+6. 跑一次 `test_command` 建立基线（若已失败 → 先向主 agent 说明原因再继续）
+
+### §3.2 规划（Plan，只做一次）
+
+Explore repo 后生成：
+
+**TASKS/\<mid\>-\<简述\>.md**：Roadpoint 列表，每个 Roadpoint 必填：
+- Acceptance（3-5 条验收标准）
+- Tests Plan（见下方 §3.2.1）
+- DoD：`test_command` 全绿 + C1/C2/C3 齐全 + PROGRESS 记录完整
+- 状态：TODO/DOING/DONE/BLOCKED
+
+**PROGRESS/\<mid\>-\<简述\>.md**：初始化文件，后续每个 Roadpoint 完成后补齐记录。
+
+提交一次计划提交 + `git push -u origin <branch>`。
+
+#### §3.2.1 Tests Plan（核心：测试必须证明产品能用）
+
+规划测试时，按以下顺序思考：
+
+**第一步：确定"怎么证明这个功能对用户真的能用"**
+
+- 这个改动最终影响用户的入口是什么？（浏览器页面？CLI 命令？HTTP API？）
+- 用户会怎么触发这个功能？
+- 如果我是用户，我怎么验证它 work 了？
+
+**第二步：选择测试策略**
+
+| 场景 | 策略 |
+|------|------|
+| 新功能（后端/API） | **必须**至少一个真实入口测试（HTTP 请求/CLI 命令），证明用户真的能调通 |
+| 新功能（前端 UI） | **必须**至少一个组件交互测试：模拟用户操作（点击/输入/选择）→ 断言页面可见结果（文字/元素出现/消失/变化）。不接受只测内部 state 变化 |
+| Bug 修复 | 优先在现有测试文件中补充能复现该 bug 的用例。不要新建文件除非现有文件确实不合适 |
+| 重构 | 现有测试应该不改就能通过（行为不变）。如果需要改测试，说明行为变了，要重新审视 |
+| 纯内部改动（不影响用户入口） | 单元测试/集成测试即可，但要确认确实不影响入口 |
+
+**第三步：避免常见陷阱**
+
+- ❌ 每个内部函数都写单元测试 → 测试爆炸，重构时全部要改
+- ❌ mock 掉所有依赖 → 测试通过但真实链路断了
+- ❌ 为了凑测试数量新建大量小文件 → 维护噩梦
+- ✅ 一个测试覆盖完整链路 > 五个测试各 mock 一段
+- ✅ 修改现有测试文件 > 新建测试文件
+- ✅ 删除被新测试覆盖的旧测试
+
+### §3.3 执行（C1/C2/C3 循环）
+
+每个 Roadpoint 严格执行：
+
+| 步骤 | 做什么 | 提交 |
+|------|--------|------|
+| Red | 写测试，确认失败点=当前缺失能力 | C1: `test(Rx.y): <描述>` |
+| Green | 最小实现让测试通过 | — |
+| Refactor | 行为不变的重构（改行为需先补测试） | — |
+| 门禁 | `test_command` 全绿 | — |
+| Commit | 提交实现 | C2: `feat\|fix\|refactor(Rx.y): <描述>` |
+| 文档 | 更新 TASKS（状态→DONE）+ PROGRESS（补齐记录） | C3: `docs(Rx.y): <描述>` |
+| Push | `git push` 保存现场 | — |
+
+冒号后描述用中文，简短具体。
+
+**PROGRESS 记录模板**（每个 Roadpoint 完成后补齐）：
+
+```md
+### Rx.y <标题>
+- Context: <问题/约束/边界>
+- Decision: <最终方案>
+- Rationale: <为什么这样做>
+- Evidence:
+  - Tests: <test_command 结果>
+  - Entry: <真实入口验证结果，不是"单元测试通过">
+- Rollback: <回退到哪个 commit>
+- Commits: C1=<...>, C2=<...>, C3=<...>
+- Next: <下一步>
+```
+
+可复用的经验/坑才写 LOGBOOK.md，实现思路写 PROGRESS。
+
+### §3.4 集成到 main
+
+所有 Roadpoint DONE 且满足 `exit_criteria` 后：
+
+```bash
+git fetch origin
+git rebase origin/main          # 冲突处理见 §4.1
+test_command                    # 必须全绿
+
+# 获取合并锁
+mkdir data/locks/merge.lock     # 目录锁
+
+# 合并（worktree 内无法 checkout main，回主仓）
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+git checkout main && git pull --rebase origin main
+git merge --no-ff <branch>
+git push origin main
+
+# 释放合并锁
+rmdir data/locks/merge.lock
+
+# 更新状态
+python3 <script> update --path data/dev-tasks.json \
+  --milestone-id "<mid>" --status DONE \
+  --result-json '{"solution_summary":"...","tests":"...","commits":{...}}'
+```
+
+### §3.5 清理与交接
+
+**正常完成（DONE）：**
+1. 退出 worktree_dir，在主仓执行：
+   - `git worktree remove <worktree_dir>`
+   - `git branch -d <branch>`（提示未合并 → 集成未成功，停止并报告）
+2. 向主 agent 回传：状态、Roadpoint 完成情况、关键设计摘要、新 prevention_rules
+
+**需要交棒（未完成）：**
+1. 更新 TASKS/PROGRESS/LOGBOOK 并提交 + push
+2. 用脚本释放 milestone（→READY 或→BLOCKED），**保留 worktree/branch** 以便续跑
+3. 向主 agent 回传：当前状态、卡点、回退目标 commit
 
 ---
 
-## 6) 测试失败处理
+## §4 异常处理
 
-1. 运行 `test_command`  
-2. 分析失败原因  
-3. 修复  
-4. 重跑直到全绿  
-5. 提交修复
+### §4.1 Rebase 冲突
 
----
+```
+git status → 查看冲突文件 → 逐文件理解双方意图 → 手动解决
+git add <resolved> → git rebase --continue → 重复直到完成
+```
 
-## 7) 回退策略（唯一）
+禁止直接放弃或标记失败。
+
+### §4.2 测试失败
+
+分析原因 → 修复 → 重跑 → 全绿 → 提交修复。
+
+### §4.3 连续失败回退
 
 同一 Roadpoint 连续失败 > 6 次：
-
-1. 回退到最近可靠提交（优先该 Roadpoint 的 C1 或更早全绿点）  
-2. 在 `PROGRESS/<milestone_id>-<简述>.md` 的该 Roadpoint 条目追加/补齐：
-   - 失败现象与根因假设
-   - 失败次数
-   - 回退目标提交
-   - 重拆分方案（新的 Roadpoint 切法/新的测试策略）
-   - 若沉淀出可复用“预防规则/坑位”，再追加到 `LOGBOOK.md`
+1. 回退到上一稳定 commit（该 Roadpoint 的 C1 或上一 Roadpoint 的 C3）
+2. 在 PROGRESS 中记录：失败现象、根因、回退目标、重拆方案
 3. Roadpoint 拆小，从 Red 重做
 
 ---
 
-## 8) 交接/回传（给主 agent）
+## §5 工具
 
-主 agent 主要关心：Milestone 是否可继续推进、整体设计思路、以及如何换人续跑。
+脚本路径：`/Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py`
 
-回传必须包含（简短即可）：
-1. Milestone 当前状态：DONE / BLOCKED / 仍在 RUNNING  
-2. `TASKS/<milestone_id>-<简述>.md` 中 Roadpoint 完成情况摘要（哪些已完成/剩哪些）  
-3. 关键实现设计摘要（可直接引用 `PROGRESS/<milestone_id>-<简述>.md` 的要点）  
-4. 是否需要回退：回退到哪个“最近稳定 commit”（通常上一 Roadpoint 的 C3）  
-5. 新增的 `prevention_rules`（如有，写入 LOGBOOK 并在回传里列出）  
+```bash
+# 更新状态
+python3 <script> update --path data/dev-tasks.json --milestone-id "<mid>" --status RUNNING --claimed-by "agent-x"
 
-若你需要停止或交棒：
-1. 确保 `TASKS/PROGRESS/LOGBOOK` 已更新并提交到 Milestone 分支  
-2. `git push`（保存现场）  
-3. 通过工具/脚本将 `data/dev-tasks.json` 中该 Milestone 释放（回到 READY）或标记 BLOCKED（写明原因），并保留 `worktree_dir/branch` 以便新 sub agent 复用
+# 完成
+python3 <script> update --path data/dev-tasks.json --milestone-id "<mid>" --status DONE --result-json '{"solution_summary":"...","tests":"...","commits":{...}}'
 
-脚本路径：
-- `/Users/czj/.codex/skills/project-lead-orchestrator/scripts/dev_tasks.py`
+# 释放（交棒）
+python3 <script> update --path data/dev-tasks.json --milestone-id "<mid>" --status READY
+```

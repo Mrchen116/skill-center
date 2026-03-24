@@ -1,6 +1,6 @@
 ---
 name: project-lead-orchestrator
-description: 主 agent 项目负责人/调度技能。两层循环：外层分解需求→内层并行执行 milestone→产品验收→问题回流。用 data/dev-tasks.json 调度，派发 tdd-execution-worker 和 product-acceptance-reviewer。
+description: 用于需要拆分需求为多个 milestone 并调度 subagent 并行执行的场景。触发条件：用户要求完成一个涉及多步骤/多模块的需求，或要求"跑完所有 milestone"/"把这个需求做完"。不要用于：单个小任务直接实现、纯代码审查、纯产品验收（用 product-acceptance-reviewer）、纯编码执行（用 tdd-execution-worker）。
 ---
 
 # Project Lead Orchestrator
