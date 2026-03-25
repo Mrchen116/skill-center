@@ -43,7 +43,6 @@ use_worktree: true|false
 worktree_dir: <绝对路径>    # use_worktree=true 时必须
 branch: milestone/<mid>
 test_command: <测试命令>
-allowed_scope: <允许改动的文件/目录>
 forbidden_scope: <禁止改动的文件/目录>
 prevention_rules: <LOGBOOK 中的相关经验>
 dev_tasks_path: data/dev-tasks.json

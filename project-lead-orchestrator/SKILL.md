@@ -117,8 +117,7 @@ use_worktree: true|false
 worktree_dir: <绝对路径>/.worktrees/<mid>
 branch: milestone/<mid>
 test_command: <测试命令>
-allowed_scope: <允许改动的文件/目录列表>
-forbidden_scope: <禁止改动的文件/目录列表>
+forbidden_scope: <禁止改动的文件/目录，仅在有明确理由时填写，否则省略>
 prevention_rules: <从 LOGBOOK 提取的相关经验>
 dev_tasks_path: data/dev-tasks.json
 ```
